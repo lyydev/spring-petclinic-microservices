@@ -1,0 +1,109 @@
+# Reusable Composite Action: Trivy Container Vulnerability Gate
+# Stories: PETPLAT-105, PETPLAT-53
+#
+# Scans locally built ARM64 Docker images BEFORE pushing to Amazon ECR:
+# - Generates a full JSON report of HIGH and CRITICAL findings and uploads it as a build artifact
+# - Emits non-blocking GitHub Actions warnings for HIGH vulnerabilities
+# - Honors .trivyignore allowlist for documented, time-bounded exceptions
+# - Fails the pipeline (exit code 1) if any CRITICAL vulnerabilities are found
+
+name: "Trivy Image Vulnerability Gate"
+description: "Scan container image with Trivy, upload audit artifact, warn on HIGH, and fail on CRITICAL CVEs"
+
+inputs:
+  image-ref:
+    description: "Local Docker image tag to scan before pushing to ECR"
+    required: true
+  service:
+    description: "Petclinic service name (used for artifact naming)"
+    required: true
+  short-sha:
+    description: "7-character Git commit SHA"
+    required: true
+  trivyignore-path:
+    description: "Path to Trivy CVE allowlist file"
+    required: false
+    default: ".trivyignore"
+  artifact-retention-days:
+    description: "Days to retain Trivy scan report artifacts"
+    required: false
+    default: "30"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate scan inputs
+      shell: bash
+      env:
+        SERVICE_NAME: ${{ inputs.service }}
+        SHORT_SHA: ${{ inputs.short-sha }}
+      run: |
+        set -euo pipefail
+        if [[ ! "${SERVICE_NAME}" =~ ^[a-z0-9-]+$ ]]; then
+          echo "::error::Invalid service name '${SERVICE_NAME}'."
+          exit 1
+        fi
+        if [[ ! "${SHORT_SHA}" =~ ^[0-9a-f]{7}$ ]]; then
+          echo "::error::Invalid 7-character commit SHA '${SHORT_SHA}'."
+          exit 1
+        fi
+
+    - name: Run Trivy scan for audit report (HIGH and CRITICAL)
+      uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+      with:
+        image-ref: ${{ inputs.image-ref }}
+        format: "json"
+        output: "trivy-results-${{ inputs.service }}-${{ inputs.short-sha }}.json"
+        severity: "HIGH,CRITICAL"
+        vuln-type: "os,library"
+        exit-code: "0"
+        trivyignores: ${{ inputs.trivyignore-path }}
+
+    - name: Emit HIGH vulnerability warnings and step summary
+      shell: bash
+      env:
+        SERVICE_NAME: ${{ inputs.service }}
+        SHORT_SHA: ${{ inputs.short-sha }}
+        IMAGE_REF: ${{ inputs.image-ref }}
+      run: |
+        set -euo pipefail
+        REPORT_FILE="trivy-results-${SERVICE_NAME}-${SHORT_SHA}.json"
+        if [[ ! -f "${REPORT_FILE}" ]]; then
+          echo "::error::Expected Trivy JSON report '${REPORT_FILE}' was not generated."
+          exit 1
+        fi
+
+        HIGH_COUNT="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "${REPORT_FILE}")"
+        CRITICAL_COUNT="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "${REPORT_FILE}")"
+
+        {
+          echo "### Trivy Scan Summary — \`${SERVICE_NAME}:${SHORT_SHA}\`"
+          echo "| Severity | Count | Gate Policy |"
+          echo "|----------|-------|-------------|"
+          echo "| **CRITICAL** | ${CRITICAL_COUNT} | **Blocking** (\`exit 1\`) |"
+          echo "| **HIGH** | ${HIGH_COUNT} | Warning only (non-blocking) |"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        if (( HIGH_COUNT > 0 )); then
+          echo "::warning::${SERVICE_NAME}:${SHORT_SHA} has ${HIGH_COUNT} HIGH vulnerability finding(s). Download the Trivy artifact for full CVE details."
+          jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH") | "::warning::[\(.VulnerabilityID)] \(.PkgName) \(.InstalledVersion) -> fixed in \(.FixedVersion // "unfixed")"' "${REPORT_FILE}" | head -n 20
+        fi
+
+    - name: Upload Trivy scan report artifact
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: trivy-scan-${{ inputs.service }}-${{ inputs.short-sha }}
+        path: trivy-results-${{ inputs.service }}-${{ inputs.short-sha }}.json
+        retention-days: ${{ inputs.artifact-retention-days }}
+        if-no-files-found: error
+
+    - name: Enforce Trivy CRITICAL vulnerability gate
+      uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+      with:
+        image-ref: ${{ inputs.image-ref }}
+        format: "table"
+        severity: "CRITICAL"
+        vuln-type: "os,library"
+        exit-code: "1"
+        trivyignores: ${{ inputs.trivyignore-path }}

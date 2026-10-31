@@ -1,0 +1,94 @@
+# Reusable Composite Action: Dispatch Built Image Tags to Platform Repository
+# Stories: PETPLAT-49, PETPLAT-50, PETPLAT-53
+#
+# Fires a GitHub repository_dispatch event (type: app-image-built) to the
+# petclinic-platform GitOps repository containing ONLY the 7-character commit SHA
+# and the list of services that changed and were pushed to ECR.
+
+name: "Dispatch Image Build Event to Platform Repo"
+description: "Send repository_dispatch (app-image-built) with SHA and changed services to petclinic-platform"
+
+inputs:
+  platform-repo:
+    description: "Target GitOps platform repository in owner/repo format (e.g. lyydev/petclinic-platform)"
+    required: true
+  platform-token:
+    description: "Fine-grained GitHub PAT with write access to the platform repository (PLATFORM_REPO_TOKEN)"
+    required: true
+  sha:
+    description: "7-character commit SHA tag pushed to Amazon ECR"
+    required: true
+  services-json:
+    description: "JSON array of service names that changed and were built/pushed"
+    required: true
+  event-type:
+    description: "GitHub repository_dispatch event type"
+    required: false
+    default: "app-image-built"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Trigger repository_dispatch on platform repository
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.platform-token }}
+        PLATFORM_REPO: ${{ inputs.platform-repo }}
+        SHORT_SHA: ${{ inputs.sha }}
+        SERVICES_JSON: ${{ inputs.services-json }}
+        EVENT_TYPE: ${{ inputs.event-type }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${GH_TOKEN}" ]]; then
+          echo "::error::PLATFORM_REPO_TOKEN secret is not set. Create a GitHub PAT with Contents: Read & write on '${PLATFORM_REPO}' and add it as PLATFORM_REPO_TOKEN."
+          exit 1
+        fi
+
+        if [[ ! "${PLATFORM_REPO}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+          echo "::error::Invalid platform repository format '${PLATFORM_REPO}'. Expected 'owner/repo'."
+          exit 1
+        fi
+
+        if [[ ! "${EVENT_TYPE}" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+          echo "::error::Invalid repository_dispatch event type '${EVENT_TYPE}'."
+          exit 1
+        fi
+
+        if [[ ! "${SHORT_SHA}" =~ ^[0-9a-f]{7}$ ]]; then
+          echo "::error::Invalid 7-character commit SHA '${SHORT_SHA}'."
+          exit 1
+        fi
+
+        SERVICE_COUNT="$(jq 'if type == "array" then length else 0 end' <<< "${SERVICES_JSON}")"
+        if (( SERVICE_COUNT == 0 )); then
+          echo "::error::Refusing to fire repository_dispatch with an empty changed-services list."
+          exit 1
+        fi
+
+        PAYLOAD="$(jq -n \
+          --arg event_type "${EVENT_TYPE}" \
+          --arg sha "${SHORT_SHA}" \
+          --argjson services "${SERVICES_JSON}" \
+          '{
+            event_type: $event_type,
+            client_payload: {
+              sha: $sha,
+              services: $services
+            }
+          }')"
+
+        gh api "repos/${PLATFORM_REPO}/dispatches" \
+          --method POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          --input - <<< "${PAYLOAD}"
+
+        READABLE_SERVICES="$(jq -r 'join(", ")' <<< "${SERVICES_JSON}")"
+        {
+          echo "### GitOps Dispatch Sent"
+          echo "- **Target Repository:** \`${PLATFORM_REPO}\`"
+          echo "- **Event Type:** \`${EVENT_TYPE}\`"
+          echo "- **Image Tag (SHA):** \`${SHORT_SHA}\`"
+          echo "- **Changed Services (${SERVICE_COUNT}):** \`${READABLE_SERVICES}\`"
+        } >> "${GITHUB_STEP_SUMMARY}"

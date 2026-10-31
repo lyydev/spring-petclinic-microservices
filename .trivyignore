@@ -1,0 +1,13 @@
+# Trivy Vulnerability Allowlist — Spring Petclinic Microservices
+# Story: PETPLAT-105
+#
+# Governance Rules:
+# 1. Only add a CVE ID here after verifying that no upstream patch exists or that
+#    the vulnerable code path is unreachable at runtime in Petclinic.
+# 2. Every entry MUST include an inline comment with:
+#    - Justification & affected package
+#    - Approver role (e.g., Security / Platform Lead)
+#    - Review / expiration date using Trivy's exp:YYYY-MM-DD syntax
+#
+# Example format (keep commented unless actively approved):
+# CVE-2024-00000 exp:2026-12-31 # Reason: no upstream fix in transitive test-only lib; approved by Platform Lead

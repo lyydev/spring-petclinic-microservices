@@ -1,0 +1,265 @@
+# Build, Scan, and Push ARM64 Images Pipeline (Application Repo Fork)
+# Stories: PETPLAT-49, PETPLAT-105, PETPLAT-53
+#
+# Architecture:
+# 1. Detects which of the 8 microservice directories changed on push to main
+#    using dorny/paths-filter (one boolean per service).
+# 2. Builds a dynamic matrix containing ONLY services where changed == 'true'.
+# 3. Compiles each changed service JAR with JDK 17 and builds a linux/arm64
+#    Docker image using QEMU + Docker Buildx (--platform linux/arm64 --load).
+# 4. Scans each image with Trivy BEFORE pushing to ECR — fails on CRITICAL CVEs,
+#    emits warnings on HIGH CVEs, honors .trivyignore, and uploads scan artifacts.
+# 5. Authenticates to AWS via OIDC (aws-actions/configure-aws-credentials with
+#    role-to-assume — zero static keys) and pushes 7-char SHA tags to ECR.
+# 6. Fires repository_dispatch (type: app-image-built) to the platform repo
+#    using PLATFORM_REPO_TOKEN with the 7-char SHA and ONLY the changed services.
+
+name: Build, Scan, and Push ARM64 Images
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      has_changes: ${{ steps.matrix.outputs.has_changes }}
+      short_sha: ${{ steps.matrix.outputs.short_sha }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      changed_services_json: ${{ steps.matrix.outputs.changed_services_json }}
+      config-server: ${{ steps.filter.outputs.config-server }}
+      discovery-server: ${{ steps.filter.outputs.discovery-server }}
+      api-gateway: ${{ steps.filter.outputs.api-gateway }}
+      customers-service: ${{ steps.filter.outputs.customers-service }}
+      visits-service: ${{ steps.filter.outputs.visits-service }}
+      vets-service: ${{ steps.filter.outputs.vets-service }}
+      genai-service: ${{ steps.filter.outputs.genai-service }}
+      admin-server: ${{ steps.filter.outputs.admin-server }}
+
+    steps:
+      - name: Checkout repository history for diffing
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Detect modified service directories
+        id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+
+      - name: Build dynamic matrix from paths-filter booleans
+        id: matrix
+        env:
+          FULL_SHA: ${{ github.sha }}
+          CHANGED_CONFIG_SERVER: ${{ steps.filter.outputs.config-server }}
+          CHANGED_DISCOVERY_SERVER: ${{ steps.filter.outputs.discovery-server }}
+          CHANGED_API_GATEWAY: ${{ steps.filter.outputs.api-gateway }}
+          CHANGED_CUSTOMERS_SERVICE: ${{ steps.filter.outputs.customers-service }}
+          CHANGED_VISITS_SERVICE: ${{ steps.filter.outputs.visits-service }}
+          CHANGED_VETS_SERVICE: ${{ steps.filter.outputs.vets-service }}
+          CHANGED_GENAI_SERVICE: ${{ steps.filter.outputs.genai-service }}
+          CHANGED_ADMIN_SERVER: ${{ steps.filter.outputs.admin-server }}
+        run: |
+          set -euo pipefail
+
+          # 7-character commit SHA (github.sha[:7]) — never 'latest' or semantic version
+          SHORT_SHA="${FULL_SHA:0:7}"
+          SHORT_SHA="${SHORT_SHA,,}"
+
+          CANDIDATES="$(jq -n \
+            --arg cs "${CHANGED_CONFIG_SERVER}" \
+            --arg ds "${CHANGED_DISCOVERY_SERVER}" \
+            --arg gw "${CHANGED_API_GATEWAY}" \
+            --arg cu "${CHANGED_CUSTOMERS_SERVICE}" \
+            --arg vi "${CHANGED_VISITS_SERVICE}" \
+            --arg ve "${CHANGED_VETS_SERVICE}" \
+            --arg ga "${CHANGED_GENAI_SERVICE}" \
+            --arg ad "${CHANGED_ADMIN_SERVER}" \
+            '[
+              {service: "config-server",     module: "spring-petclinic-config-server",     port: "8888", changed: $cs},
+              {service: "discovery-server",  module: "spring-petclinic-discovery-server",  port: "8761", changed: $ds},
+              {service: "api-gateway",       module: "spring-petclinic-api-gateway",       port: "8080", changed: $gw},
+              {service: "customers-service", module: "spring-petclinic-customers-service", port: "8081", changed: $cu},
+              {service: "visits-service",    module: "spring-petclinic-visits-service",    port: "8082", changed: $vi},
+              {service: "vets-service",      module: "spring-petclinic-vets-service",      port: "8083", changed: $ve},
+              {service: "genai-service",     module: "spring-petclinic-genai-service",     port: "8084", changed: $ga},
+              {service: "admin-server",      module: "spring-petclinic-admin-server",      port: "9090", changed: $ad}
+            ]')"
+
+          # Only include matrix entries where changed == "true"
+          MATRIX_JSON="$(jq -c '[.[] | select(.changed == "true")]' <<< "${CANDIDATES}")"
+          CHANGED_SERVICES_JSON="$(jq -c '[.[] | select(.changed == "true") | .service]' <<< "${CANDIDATES}")"
+          CHANGED_COUNT="$(jq 'length' <<< "${MATRIX_JSON}")"
+
+          if (( CHANGED_COUNT > 0 )); then
+            HAS_CHANGES="true"
+          else
+            HAS_CHANGES="false"
+          fi
+
+          echo "short_sha=${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "has_changes=${HAS_CHANGES}" >> "${GITHUB_OUTPUT}"
+          echo "matrix=${MATRIX_JSON}" >> "${GITHUB_OUTPUT}"
+          echo "changed_services_json=${CHANGED_SERVICES_JSON}" >> "${GITHUB_OUTPUT}"
+
+          echo "Short commit SHA: ${SHORT_SHA}"
+          echo "Changed services (${CHANGED_COUNT}): ${CHANGED_SERVICES_JSON}"
+
+  build:
+    name: Build, Scan & Push (${{ matrix.service }})
+    needs: changes
+    if: needs.changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.changes.outputs.matrix) }}
+
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "maven"
+
+      - name: Set up QEMU for ARM64 cross-compilation
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: "arm64"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Compile JAR and build linux/arm64 Docker image
+        id: build-image
+        env:
+          SERVICE_NAME: ${{ matrix.service }}
+          MODULE_DIR: ${{ matrix.module }}
+          SERVICE_PORT: ${{ matrix.port }}
+          SHORT_SHA: ${{ needs.changes.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          chmod +x ./mvnw
+          ./mvnw -B -ntp -pl "${MODULE_DIR}" -am clean package
+
+          JAR_FILE="$(find "${MODULE_DIR}/target" -maxdepth 1 -type f \
+            -name "${MODULE_DIR}-*.jar" \
+            ! -name "*-sources.jar" \
+            ! -name "*-javadoc.jar" \
+            ! -name "*-tests.jar" | head -n 1)"
+
+          if [[ -z "${JAR_FILE}" ]]; then
+            echo "::error::Executable Spring Boot JAR not found in ${MODULE_DIR}/target"
+            exit 1
+          fi
+
+          ARTIFACT_NAME="$(basename "${JAR_FILE}" .jar)"
+          LOCAL_IMAGE="petclinic-dev/${SERVICE_NAME}:${SHORT_SHA}"
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --load \
+            --file docker/Dockerfile \
+            --build-arg "ARTIFACT_NAME=${ARTIFACT_NAME}" \
+            --build-arg "EXPOSED_PORT=${SERVICE_PORT}" \
+            --tag "${LOCAL_IMAGE}" \
+            "${MODULE_DIR}/target"
+
+          IMAGE_ARCH="$(docker image inspect "${LOCAL_IMAGE}" --format '{{.Architecture}}')"
+          if [[ "${IMAGE_ARCH}" != "arm64" ]]; then
+            echo "::error::Expected arm64 image architecture, got '${IMAGE_ARCH}'."
+            exit 1
+          fi
+
+          echo "local_image=${LOCAL_IMAGE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Scan image with Trivy before ECR push (fail on CRITICAL CVEs)
+        uses: ./.github/workflows/reusable/trivy-scan
+        with:
+          image-ref: ${{ steps.build-image.outputs.local_image }}
+          service: ${{ matrix.service }}
+          short-sha: ${{ needs.changes.outputs.short_sha }}
+          trivyignore-path: ".trivyignore"
+
+      - name: Authenticate to AWS via OIDC and login to ECR
+        id: ecr
+        uses: ./.github/workflows/reusable/ecr-login
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+
+      - name: Push verified ARM64 image to Amazon ECR
+        env:
+          LOCAL_IMAGE: ${{ steps.build-image.outputs.local_image }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SERVICE_NAME: ${{ matrix.service }}
+          SHORT_SHA: ${{ needs.changes.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          ECR_IMAGE_URI="${ECR_REGISTRY}/petclinic-dev/${SERVICE_NAME}:${SHORT_SHA}"
+          docker tag "${LOCAL_IMAGE}" "${ECR_IMAGE_URI}"
+          docker push "${ECR_IMAGE_URI}"
+          echo "Pushed ${ECR_IMAGE_URI}"
+
+  notify-platform:
+    name: Trigger GitOps Tag Update in Platform Repo
+    needs:
+      - changes
+      - build
+    if: success() && needs.changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Fire repository_dispatch (app-image-built) to platform repo
+        uses: ./.github/workflows/reusable/dispatch-platform
+        with:
+          platform-repo: "${{ github.repository_owner }}/petclinic-platform"
+          platform-token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          event-type: "app-image-built"
+          sha: ${{ needs.changes.outputs.short_sha }}
+          services-json: ${{ needs.changes.outputs.changed_services_json }}
