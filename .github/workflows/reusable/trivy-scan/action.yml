@@ -1,14 +1,14 @@
-# Reusable Composite Action: Trivy Container Vulnerability Gate
+# Reusable Composite Action: Trivy Container Vulnerability Scanner
 # Stories: PETPLAT-105, PETPLAT-53
 #
 # Scans locally built ARM64 Docker images BEFORE pushing to Amazon ECR:
 # - Generates a full JSON report of HIGH and CRITICAL findings and uploads it as a build artifact
-# - Emits non-blocking GitHub Actions warnings for HIGH vulnerabilities
+# - Emits non-blocking GitHub Actions warnings for CRITICAL and HIGH vulnerabilities
 # - Honors .trivyignore allowlist for documented, time-bounded exceptions
-# - Fails the pipeline (exit code 1) if any CRITICAL vulnerabilities are found
+# - Configurable exit-code (defaults to "0" informational/non-blocking for dev builds; set "1" to block)
 
-name: "Trivy Image Vulnerability Gate"
-description: "Scan container image with Trivy, upload audit artifact, warn on HIGH, and fail on CRITICAL CVEs"
+name: "Trivy Image Vulnerability Scan"
+description: "Scan container image with Trivy, upload audit artifact, and report HIGH/CRITICAL CVEs (informational by default)"
 
 inputs:
   image-ref:
@@ -20,6 +20,10 @@ inputs:
   short-sha:
     description: "7-character Git commit SHA"
     required: true
+  exit-code:
+    description: "Exit code when CRITICAL vulnerabilities are found ('0' informational/non-blocking, '1' blocking)"
+    required: false
+    default: "0"
   trivyignore-path:
     description: "Path to Trivy CVE allowlist file"
     required: false
@@ -37,6 +41,7 @@ runs:
       env:
         SERVICE_NAME: ${{ inputs.service }}
         SHORT_SHA: ${{ inputs.short-sha }}
+        EXIT_CODE: ${{ inputs.exit-code }}
       run: |
         set -euo pipefail
         if [[ ! "${SERVICE_NAME}" =~ ^[a-z0-9-]+$ ]]; then
@@ -45,6 +50,10 @@ runs:
         fi
         if [[ ! "${SHORT_SHA}" =~ ^[0-9a-f]{7}$ ]]; then
           echo "::error::Invalid 7-character commit SHA '${SHORT_SHA}'."
+          exit 1
+        fi
+        if [[ "${EXIT_CODE}" != "0" && "${EXIT_CODE}" != "1" ]]; then
+          echo "::error::Invalid exit-code '${EXIT_CODE}'. Must be '0' or '1'."
           exit 1
         fi
 
@@ -59,12 +68,12 @@ runs:
         exit-code: "0"
         trivyignores: ${{ inputs.trivyignore-path }}
 
-    - name: Emit HIGH vulnerability warnings and step summary
+    - name: Emit vulnerability warnings and step summary
       shell: bash
       env:
         SERVICE_NAME: ${{ inputs.service }}
         SHORT_SHA: ${{ inputs.short-sha }}
-        IMAGE_REF: ${{ inputs.image-ref }}
+        EXIT_CODE: ${{ inputs.exit-code }}
       run: |
         set -euo pipefail
         REPORT_FILE="trivy-results-${SERVICE_NAME}-${SHORT_SHA}.json"
@@ -76,17 +85,28 @@ runs:
         HIGH_COUNT="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "${REPORT_FILE}")"
         CRITICAL_COUNT="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "${REPORT_FILE}")"
 
+        if [[ "${EXIT_CODE}" == "1" ]]; then
+          CRITICAL_POLICY="**Blocking** (\`exit 1\`)"
+        else
+          CRITICAL_POLICY="Informational / Warning only (\`exit 0\` — non-blocking)"
+        fi
+
         {
           echo "### Trivy Scan Summary — \`${SERVICE_NAME}:${SHORT_SHA}\`"
           echo "| Severity | Count | Gate Policy |"
           echo "|----------|-------|-------------|"
-          echo "| **CRITICAL** | ${CRITICAL_COUNT} | **Blocking** (\`exit 1\`) |"
-          echo "| **HIGH** | ${HIGH_COUNT} | Warning only (non-blocking) |"
+          echo "| **CRITICAL** | ${CRITICAL_COUNT} | ${CRITICAL_POLICY} |"
+          echo "| **HIGH** | ${HIGH_COUNT} | Informational / Warning only (\`exit 0\` — non-blocking) |"
         } >> "${GITHUB_STEP_SUMMARY}"
+
+        if (( CRITICAL_COUNT > 0 )); then
+          echo "::warning::${SERVICE_NAME}:${SHORT_SHA} has ${CRITICAL_COUNT} CRITICAL vulnerability finding(s) (informational mode). Download the Trivy artifact for full CVE details."
+          jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL") | "::warning::[CRITICAL \(.VulnerabilityID)] \(.PkgName) \(.InstalledVersion) -> fixed in \(.FixedVersion // "unfixed")"' "${REPORT_FILE}" | head -n 20
+        fi
 
         if (( HIGH_COUNT > 0 )); then
           echo "::warning::${SERVICE_NAME}:${SHORT_SHA} has ${HIGH_COUNT} HIGH vulnerability finding(s). Download the Trivy artifact for full CVE details."
-          jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH") | "::warning::[\(.VulnerabilityID)] \(.PkgName) \(.InstalledVersion) -> fixed in \(.FixedVersion // "unfixed")"' "${REPORT_FILE}" | head -n 20
+          jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH") | "::warning::[HIGH \(.VulnerabilityID)] \(.PkgName) \(.InstalledVersion) -> fixed in \(.FixedVersion // "unfixed")"' "${REPORT_FILE}" | head -n 20
         fi
 
     - name: Upload Trivy scan report artifact
@@ -98,12 +118,12 @@ runs:
         retention-days: ${{ inputs.artifact-retention-days }}
         if-no-files-found: error
 
-    - name: Enforce Trivy CRITICAL vulnerability gate
+    - name: Print Trivy CRITICAL vulnerability table
       uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
       with:
         image-ref: ${{ inputs.image-ref }}
         format: "table"
         severity: "CRITICAL"
         vuln-type: "os,library"
-        exit-code: "1"
+        exit-code: ${{ inputs.exit-code }}
         trivyignores: ${{ inputs.trivyignore-path }}

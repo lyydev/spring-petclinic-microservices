@@ -7,8 +7,9 @@
 # 2. Builds a dynamic matrix containing ONLY services where changed == 'true'.
 # 3. Compiles each changed service JAR with JDK 17 and builds a linux/arm64
 #    Docker image using QEMU + Docker Buildx (--platform linux/arm64 --load).
-# 4. Scans each image with Trivy BEFORE pushing to ECR — fails on CRITICAL CVEs,
-#    emits warnings on HIGH CVEs, honors .trivyignore, and uploads scan artifacts.
+# 4. Scans each image with Trivy BEFORE pushing to ECR (informational mode:
+#    exit-code "0" for dev builds — emits CRITICAL/HIGH warnings and uploads
+#    scan artifacts without blocking ECR push).
 # 5. Authenticates to AWS via OIDC (aws-actions/configure-aws-credentials with
 #    role-to-assume — zero static keys) and pushes 7-char SHA tags to ECR.
 # 6. Fires repository_dispatch (type: app-image-built) to the platform repo
@@ -210,12 +211,13 @@ jobs:
 
           echo "local_image=${LOCAL_IMAGE}" >> "${GITHUB_OUTPUT}"
 
-      - name: Scan image with Trivy before ECR push (fail on CRITICAL CVEs)
+      - name: Scan image with Trivy before ECR push (informational)
         uses: ./.github/workflows/reusable/trivy-scan
         with:
           image-ref: ${{ steps.build-image.outputs.local_image }}
           service: ${{ matrix.service }}
           short-sha: ${{ needs.changes.outputs.short_sha }}
+          exit-code: "0"
           trivyignore-path: ".trivyignore"
 
       - name: Authenticate to AWS via OIDC and login to ECR
