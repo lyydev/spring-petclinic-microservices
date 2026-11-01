@@ -41,12 +41,20 @@ runs:
         set -euo pipefail
 
         if [[ -z "${GH_TOKEN}" ]]; then
-          echo "::error::PLATFORM_REPO_TOKEN secret is not set. Create a GitHub PAT with Contents: Read & write on '${PLATFORM_REPO}' and add it as PLATFORM_REPO_TOKEN."
+          echo "::error::secrets.PLATFORM_REPO_TOKEN is not set."
           exit 1
         fi
 
+        # Normalize vars.PLATFORM_REPO whether provided as 'owner/repo', 'repo', or full GitHub URL
+        PLATFORM_REPO="${PLATFORM_REPO#https://github.com/}"
+        PLATFORM_REPO="${PLATFORM_REPO%.git}"
+        PLATFORM_REPO="${PLATFORM_REPO%/}"
+        if [[ -n "${PLATFORM_REPO}" && "${PLATFORM_REPO}" != */* ]]; then
+          PLATFORM_REPO="${GITHUB_REPOSITORY_OWNER}/${PLATFORM_REPO}"
+        fi
+
         if [[ ! "${PLATFORM_REPO}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
-          echo "::error::Invalid platform repository format '${PLATFORM_REPO}'. Expected 'owner/repo'."
+          echo "::error::Invalid vars.PLATFORM_REPO '${PLATFORM_REPO}'. Expected 'owner/repo' or 'repo'."
           exit 1
         fi
 

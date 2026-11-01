@@ -10,14 +10,14 @@ description: "Assume AWS IAM role via GitHub OIDC and authenticate Docker to Ama
 
 inputs:
   role-to-assume:
-    description: "IAM Role ARN to assume via GitHub OIDC (AWS_ROLE_ARN secret)"
+    description: "IAM Role ARN to assume via GitHub OIDC (secrets.AWS_ROLE_ARN)"
     required: true
   aws-region:
-    description: "AWS region hosting the ECR repositories (defaults to us-east-1)"
+    description: "AWS region hosting the ECR repositories (vars.AWS_REGION; defaults to us-east-1)"
     required: false
     default: "us-east-1"
   aws-account-id:
-    description: "Optional expected 12-digit AWS account ID for registry verification"
+    description: "Expected 12-digit AWS account ID for registry verification (vars.AWS_ACCOUNT_ID)"
     required: false
     default: ""
 
@@ -32,20 +32,21 @@ runs:
     - name: Validate OIDC inputs
       shell: bash
       env:
-        ROLE_ARN: ${{ inputs.role-to-assume }}
-        REGION: ${{ inputs.aws-region }}
+        AWS_ROLE_ARN: ${{ inputs.role-to-assume }}
+        AWS_REGION: ${{ inputs.aws-region }}
       run: |
         set -euo pipefail
-        if [[ -z "${ROLE_ARN}" ]]; then
-          echo "::error::AWS_ROLE_ARN secret is required for OIDC authentication."
+        AWS_REGION="${AWS_REGION:-us-east-1}"
+        if [[ -z "${AWS_ROLE_ARN}" ]]; then
+          echo "::error::secrets.AWS_ROLE_ARN is required for OIDC authentication."
           exit 1
         fi
-        if [[ ! "${ROLE_ARN}" =~ ^arn:aws:iam::[0-9]{12}:role/.+ ]]; then
-          echo "::error::Invalid IAM Role ARN format provided in role-to-assume."
+        if [[ ! "${AWS_ROLE_ARN}" =~ ^arn:aws:iam::[0-9]{12}:role/.+ ]]; then
+          echo "::error::Invalid IAM Role ARN format in secrets.AWS_ROLE_ARN."
           exit 1
         fi
-        if [[ -z "${REGION}" ]]; then
-          echo "::error::AWS region must not be empty."
+        if [[ ! "${AWS_REGION}" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]; then
+          echo "::error::Invalid vars.AWS_REGION format '${AWS_REGION}'."
           exit 1
         fi
 

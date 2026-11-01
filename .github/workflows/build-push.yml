@@ -225,8 +225,8 @@ jobs:
         uses: ./.github/workflows/reusable/ecr-login
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-          aws-account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+          aws-region: ${{ vars.AWS_REGION }}
+          aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
 
       - name: Push verified ARM64 image to Amazon ECR
         env:
@@ -260,7 +260,7 @@ jobs:
       - name: Fire repository_dispatch (app-image-built) to platform repo
         uses: ./.github/workflows/reusable/dispatch-platform
         with:
-          platform-repo: "${{ github.repository_owner }}/petclinic-platform"
+          platform-repo: ${{ vars.PLATFORM_REPO }}
           platform-token: ${{ secrets.PLATFORM_REPO_TOKEN }}
           event-type: "app-image-built"
           sha: ${{ needs.changes.outputs.short_sha }}
